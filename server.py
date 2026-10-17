@@ -18,6 +18,7 @@ Endpoints:
   GET  /api/limit?handle       → publishing limit
 """
 import json, sys, threading, time, cgi, io
+from html import escape as _esc
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
@@ -30,8 +31,9 @@ from lib import hooks  # noqa: E402
 BASE = Path(__file__).resolve().parent
 WEB = BASE / "web"
 PORT = 8455
-OAUTH_PORT = 8456           # HTTPS khusus OAuth callback
-REDIRECT_URI = f"https://localhost:{OAUTH_PORT}/callback"
+OAUTH_PORT = threads_api.LOCAL_OAUTH_PORT  # 8456, listener HTTPS lokal (mode lokal saja)
+# redirect_uri OAuth diambil dari config (THREADS_REDIRECT_URI / APP_BASE_URL), lihat
+# threads_api.oauth_config(). Production: lewat Nginx, tanpa listener 8456.
 _lock = threading.RLock()
 _last_ana_day = None   # tanggal terakhir auto-snapshot analytics jam 7 jalan
 
@@ -362,8 +364,14 @@ class H(BaseHTTPRequestHandler):
             if path == "/api/autopost":
                 return self._json(db.get_autopost(q.get("handle", [""])[0]))
             # ── OAuth (HTTP redirect, bukan JSON) ──
+            if path == "/api/oauth/info":
+                cfg = threads_api.oauth_config()
+                # URL awal login yg dipakai tombol "Connect Akun" di dashboard
+                start = (f"https://localhost:{OAUTH_PORT}/oauth/start"
+                         if cfg["local_mode"] else "/oauth/start")
+                return self._json({"start_url": start, "local_mode": cfg["local_mode"]})
             if path == "/oauth/start":
-                url, state = threads_api.oauth_authorize_url(REDIRECT_URI)
+                url, state = threads_api.oauth_authorize_url()
                 if not url:
                     return self._json({"error": state}, 400)
                 self.send_response(302)
@@ -681,29 +689,35 @@ display:flex;align-items:center;justify-content:center;height:100vh;margin:0}}
 h1{{font-size:20px;margin:0 0 8px}}p{{color:#8a8a93;font-size:14px}}
 a{{color:#5b8cff}}</style></head><body><div class=box>
 <div class=icon>{icon}</div><h1>{msg}</h1><p>{detail}</p>
-<p><a href="http://localhost:8455/">← balik ke dashboard</a></p>
+<p><a href="/">← balik ke dashboard</a></p>
 <script>setTimeout(()=>{{window.close()}},2500)</script>
 </div></body></html>"""
             data = html.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
             self.end_headers()
             self.wfile.write(data)
 
+        # state dicek PERTAMA (CSRF); sekali pakai, ada masa berlaku
+        if not threads_api.consume_oauth_state((q.get("state") or [""])[0]):
+            return _page("⚠️", "State tidak valid / kedaluwarsa",
+                         "Mulai ulang dari dashboard (Connect Akun Baru).")
         if "error" in q:
-            return _page("❌", "Ditolak",
-                         q.get("error_description", q.get("error", ["?"]))[0])
+            reason = (q.get("error_description") or q.get("error") or ["?"])[0]
+            return _page("❌", "Ditolak", _esc(reason[:200]))
         code = (q.get("code") or [""])[0].split("#_")[0].strip()
         if not code:
             return _page("⚠️", "Gak ada code di callback")
-        res = threads_api.oauth_exchange_code(code, REDIRECT_URI)
+        res = threads_api.oauth_exchange_code(code)
         if res.get("ok"):
             db.upsert_account(res["handle"], display_name=res["handle"],
                               user_id=res.get("user_id"))
-            return _page("✅", f"@{res['handle']} terhubung!",
+            return _page("✅", f"@{_esc(res['handle'])} terhubung!",
                          "Token long-lived tersimpan. Tab ini bakal nutup sendiri.")
-        return _page("❌", "Gagal connect", res.get("error", "?")[:200])
+        return _page("❌", "Gagal connect", _esc(str(res.get("error", "?"))[:200]))
 
     def _static(self, name):
         f = WEB / name
@@ -743,8 +757,14 @@ def _start_oauth_https():
 
 def main():
     db.init_db()
+    cfg = threads_api.oauth_config()
+    for prob in threads_api.oauth_config_problems(cfg):
+        print(f"[oauth] PERINGATAN: {prob}", flush=True)
+    print(f"[oauth] redirect_uri = {cfg['redirect_uri']} "
+          f"({'lokal' if cfg['local_mode'] else 'production'})", flush=True)
     threading.Thread(target=scheduler_loop, daemon=True).start()
-    threading.Thread(target=_start_oauth_https, daemon=True).start()
+    if cfg["local_mode"]:
+        threading.Thread(target=_start_oauth_https, daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), H)
     print(f"[cms] http://127.0.0.1:{PORT}", flush=True)
     srv.serve_forever()

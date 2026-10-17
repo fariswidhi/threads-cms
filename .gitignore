@@ -14,3 +14,4 @@ tls-cert.pem
 data/analytics/
 scraper_profile/
 _test_*.py
+.venv/

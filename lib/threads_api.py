@@ -448,17 +448,8 @@ def _save_token(handle, token):
 
 
 def _app_secret():
-    """Baca app_secret dari app.json bot lama (buat exchange long-lived)."""
-    appf = TOKENS.parent / "app.json"
-    if appf.exists():
-        try:
-            d = json.loads(appf.read_text())
-            s = d.get("app_secret", "")
-            if s and not str(s).startswith("ISI_"):
-                return s
-        except Exception:
-            pass
-    return None
+    """app_secret dari env (THREADS_APP_SECRET) atau app.json. Gak pernah di-log."""
+    return oauth_config().get("app_secret") or None
 
 
 def exchange_long_lived(token):
@@ -517,17 +508,37 @@ def remove_account(handle):
 
 
 # ── OAuth flow (connect akun via login Meta) ─────────────────────────────
+import os as _os
 import secrets as _secrets
+import threading as _threading
 
 _BASE = TOKENS.parent  # ~/.threads-bot (share app.json + tokens)
-_oauth_states = set()
+_CMS_DIR = Path(__file__).resolve().parent.parent
+_STATE_TTL = 600  # detik; state OAuth kedaluwarsa setelah 10 menit
+_oauth_states = {}  # state -> waktu kedaluwarsa (monotonic)
+_states_lock = _threading.Lock()
+LOCAL_OAUTH_PORT = 8456
+LOCAL_REDIRECT_URI = f"https://localhost:{LOCAL_OAUTH_PORT}/callback"
+_DEFAULT_SCOPE = ("threads_basic,threads_content_publish,"
+                  "threads_manage_replies,threads_read_replies,"
+                  "threads_manage_insights")
 
 
-def _app_config():
-    """Baca app.json (app_id, app_secret, redirect_uri, scope). Cari di CMS dir dulu,
-    fallback ke ~/.threads-bot."""
-    from pathlib import Path as _P
-    for base in [_P(__file__).resolve().parent.parent, _BASE]:
+def _load_env():
+    """Muat .env (setdefault: env proses menang). Pola sama dgn r2.py/ai.py."""
+    envf = _CMS_DIR / ".env"
+    if envf.exists():
+        for line in envf.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            _os.environ.setdefault(k.strip(), v.strip())
+
+
+def _app_json():
+    """Baca app.json (CMS dir dulu, fallback ~/.threads-bot). Kompatibel dgn setup lama."""
+    for base in (_CMS_DIR, _BASE):
         f = base / "app.json"
         if f.exists():
             try:
@@ -537,33 +548,105 @@ def _app_config():
     return {}
 
 
-def oauth_authorize_url(redirect_uri):
-    """Build URL Meta authorize. Return (url, state) atau (None, error)."""
-    cfg = _app_config()
-    app_id = cfg.get("app_id")
-    scope = cfg.get("scope", "threads_basic,threads_content_publish,"
-                             "threads_manage_replies,threads_read_replies,"
-                             "threads_manage_insights")
-    if not app_id:
-        return None, "app_id gak ada di app.json"
-    state = _secrets.token_urlsafe(16)
-    _oauth_states.add(state)
+def oauth_config():
+    """Konfigurasi OAuth terpusat. Prioritas: env/.env > app.json > default.
+
+    redirect_uri:
+      1. THREADS_REDIRECT_URI (eksplisit)
+      2. APP_BASE_URL + /callback  (production)
+      3. mode lokal lama (https://localhost:8456/callback)
+    """
+    _load_env()
+    env = _os.environ.get
+    aj = _app_json()
+    secret = env("THREADS_APP_SECRET") or aj.get("app_secret") or ""
+    if str(secret).startswith("ISI_"):
+        secret = ""
+    base_url = (env("APP_BASE_URL") or "").strip().rstrip("/")
+    redirect = (env("THREADS_REDIRECT_URI") or "").strip()
+    if not redirect and base_url:
+        redirect = base_url + "/callback"
+    if not redirect:
+        redirect = LOCAL_REDIRECT_URI
+    host = urllib.parse.urlparse(redirect).hostname or ""
+    return {
+        "app_id": env("THREADS_APP_ID") or aj.get("app_id") or "",
+        "app_secret": secret,
+        "scope": env("THREADS_SCOPE") or aj.get("scope") or _DEFAULT_SCOPE,
+        "base_url": base_url,
+        "redirect_uri": redirect,
+        # mode lokal = callback ke localhost, butuh listener HTTPS sendiri (8456)
+        "local_mode": host in ("localhost", "127.0.0.1", "::1"),
+    }
+
+
+def oauth_config_problems(cfg=None):
+    """Daftar masalah konfigurasi (string, tanpa nilai secret) buat validasi startup."""
+    cfg = cfg or oauth_config()
+    probs = []
+    if not cfg["app_id"]:
+        probs.append("THREADS_APP_ID belum di-set (.env atau app.json)")
+    if not cfg["app_secret"]:
+        probs.append("THREADS_APP_SECRET belum di-set (.env atau app.json)")
+    u = urllib.parse.urlparse(cfg["redirect_uri"])
+    if u.scheme != "https":
+        probs.append(f"redirect_uri harus HTTPS: {cfg['redirect_uri']}")
+    if not u.hostname or u.path.rstrip("/") != "/callback":
+        probs.append(f"redirect_uri harus berakhir di /callback: {cfg['redirect_uri']}")
+    if u.query or u.fragment:
+        probs.append("redirect_uri tidak boleh berisi query/fragment")
+    return probs
+
+
+def _app_config():
+    """Kompatibilitas lama: dict app_id/app_secret/scope."""
+    return oauth_config()
+
+
+def new_oauth_state():
+    """Buat state CSRF acak, kedaluwarsa dalam _STATE_TTL detik."""
+    state = _secrets.token_urlsafe(24)
+    now = time.monotonic()
+    with _states_lock:
+        for k in [k for k, exp in _oauth_states.items() if exp < now]:
+            del _oauth_states[k]
+        _oauth_states[state] = now + _STATE_TTL
+    return state
+
+
+def consume_oauth_state(state):
+    """Validasi state: harus pernah kita keluarkan, belum kedaluwarsa, sekali pakai."""
+    if not state:
+        return False
+    with _states_lock:
+        exp = _oauth_states.pop(state, None)
+    return exp is not None and exp >= time.monotonic()
+
+
+def oauth_authorize_url():
+    """Build URL Meta authorize. redirect_uri SELALU dari config (bukan input user).
+    Return (url, state) atau (None, pesan_error)."""
+    cfg = oauth_config()
+    if not cfg["app_id"]:
+        return None, "THREADS_APP_ID / app_id gak ada"
+    state = new_oauth_state()
     params = {
-        "client_id": app_id,
-        "redirect_uri": redirect_uri,
-        "scope": scope,
+        "client_id": cfg["app_id"],
+        "redirect_uri": cfg["redirect_uri"],
+        "scope": cfg["scope"],
         "response_type": "code",
         "state": state,
     }
     return "https://threads.net/oauth/authorize?" + urllib.parse.urlencode(params), state
 
 
-def oauth_exchange_code(code, redirect_uri):
+def oauth_exchange_code(code):
     """Tuker authorization code -> short token -> long-lived, validasi, simpan.
     Return {ok, handle, ...} atau {error}."""
-    cfg = _app_config()
-    app_id = cfg.get("app_id")
-    secret = cfg.get("app_secret")
+    cfg = oauth_config()
+    app_id = cfg["app_id"]
+    secret = cfg["app_secret"]
+    redirect_uri = cfg["redirect_uri"]  # identik dgn yg dikirim di authorize
     if not (app_id and secret):
         return {"error": "app_id/app_secret gak lengkap"}
     # step 1: code -> short-lived token

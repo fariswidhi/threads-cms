@@ -1075,10 +1075,13 @@ async function loadAkun(){
     el.innerHTML=accs.map(a=>`<div class="persona-item"><div class="row" style="justify-content:space-between"><span class="pn">@${esc(a.handle)}</span><button class="sm danger" onclick="delAkun('${esc(a.handle)}')">Hapus</button></div><div class="pd">${a.user_id?'id: '+esc(a.user_id):'terhubung'}</div></div>`).join("");
   }catch(e){ $("#akun-list").innerHTML=`<div class="empty">error: ${e.message}</div>`; }
 }
-$("#acc-oauth").addEventListener("click", ()=>{
-  $("#oauth-status").innerHTML='buka popup login Meta... (kalau warning sertifikat, klik lanjut)';
+$("#acc-oauth").addEventListener("click", async ()=>{
+  $("#oauth-status").innerHTML='buka popup login Meta...';
   const before=accounts.map(a=>a.handle);
-  const w=window.open("https://localhost:8456/oauth/start","oauth","width=600,height=720");
+  let startUrl="/oauth/start";
+  try{ const info=await api("/api/oauth/info"); startUrl=info.start_url;
+    if(info.local_mode) $("#oauth-status").innerHTML='buka popup login Meta... (kalau warning sertifikat, klik lanjut)'; }catch(e){}
+  const w=window.open(startUrl,"oauth","width=600,height=720");
   let tries=0; const iv=setInterval(async ()=>{ tries++;
     try{ const accs=await api("/api/accounts"); const added=accs.map(a=>a.handle).filter(h=>!before.includes(h));
       if(added.length){ clearInterval(iv); $("#oauth-status").innerHTML=`✅ @${esc(added[0])} terhubung!`; toast("connected ✓","ok"); accounts=accs; fillAccountSelects(); loadAkun(); try{w&&w.close();}catch(e){} } }catch(e){}
