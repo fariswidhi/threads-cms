@@ -116,37 +116,37 @@ class FlowTests(Base):
 
 
 class CallbackHTTPTests(Base):
-    """Callback lewat server HTTP sungguhan (port acak), exchange & DB di-mock."""
+    """Callback lewat server HTTP sungguhan (port acak, DB sementara, sudah login)."""
 
     def setUp(self):
         super().setUp()
         self.prod()
-        import server
-        self.server = server
-        self.srv = server.ThreadingHTTPServer(("127.0.0.1", 0), server.H)
-        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
-        self.base = f"http://127.0.0.1:{self.srv.server_address[1]}"
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from helpers import ServerCase
+        self.sc = ServerCase()
+        self.sc.start_server()
+        self.client = self.sc.client
+        self.assertEqual(self.client.login().status, 200)
         self.exch = mock.patch.object(t, "oauth_exchange_code",
                                       return_value={"ok": True, "handle": "akun", "user_id": "1"})
-        self.db = mock.patch.object(server.db, "upsert_account")
+        self.db = mock.patch.object(self.sc.server.db, "upsert_account")
         self.m_exch = self.exch.start()
         self.m_db = self.db.start()
 
     def tearDown(self):
         self.exch.stop(); self.db.stop()
-        self.srv.shutdown(); self.srv.server_close()
+        self.sc.stop_server()
         super().tearDown()
 
     def get(self, path):
-        class NoRedirect(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, *a, **k):
-                return None
-        op = urllib.request.build_opener(NoRedirect)
-        try:
-            r = op.open(self.base + path)
-            return r.status, r.read().decode(), r.headers
-        except urllib.error.HTTPError as e:
-            return e.code, e.read().decode(), e.headers
+        r = self.client.get(path)
+        return r.status, r.text, r.headers
+
+    def test_callback_tanpa_login_diarahkan_ke_login(self):
+        state = t.new_oauth_state()
+        r = self.client.get(f"/callback?code=abc&state={state}", cookie=False)
+        self.assertEqual((r.status, r.header("Location")), (302, "/login"))
+        self.m_exch.assert_not_called()
 
     def test_start_redirect_ke_meta_dengan_redirect_production(self):
         code, _, h = self.get("/oauth/start")

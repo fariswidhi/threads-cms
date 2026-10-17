@@ -4,7 +4,28 @@ const $$ = s => document.querySelectorAll(s);
 let accounts = [], curFilter = "", uploads = [], curPage = "dashboard";
 
 function toast(msg, kind="") { const t=$("#toast"); t.textContent=msg; t.className="show "+kind; setTimeout(()=>t.className="",3000); }
-async function api(path, opts) { const r=await fetch(path,opts); const j=await r.json(); if(!r.ok||j.error) throw new Error(j.error||("HTTP "+r.status)); return j; }
+// ── AUTH: sesi di cookie HttpOnly; request pengubah data wajib bawa token CSRF ──
+let _csrf=null, _me=null;
+function toLogin(){ location.href="/login"; return new Error("sesi berakhir, silakan login ulang"); }
+async function authInfo(){
+  if(_csrf) return _csrf;
+  const r=await fetch("/api/auth/me",{credentials:"same-origin"});
+  if(r.status===401) throw toLogin();
+  _me=await r.json(); _csrf=_me.csrf; return _csrf;
+}
+async function api(path, opts) {
+  opts=opts||{};
+  if((opts.method||"GET").toUpperCase()!=="GET"){
+    opts={...opts, headers:{...(opts.headers||{}), "X-CSRF-Token": await authInfo()}};
+  }
+  const r=await fetch(path,opts);
+  if(r.status===401) throw toLogin();
+  const j=await r.json(); if(!r.ok||j.error) throw new Error(j.error||("HTTP "+r.status)); return j;
+}
+async function logout(){
+  try{ await api("/api/auth/logout",{method:"POST"}); }catch(e){}
+  location.href="/login";
+}
 function esc(s){ return (s||"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
 function fmtNum(n){ n=n||0; if(n>=1e6) return (n/1e6).toFixed(1)+'M'; if(n>=1e3) return (n/1e3).toFixed(1)+'K'; return ''+n; }
 function curAccount(){ return $("#global-account").value; }
@@ -71,6 +92,8 @@ function initTheme(){
   document.documentElement.setAttribute("data-theme", saved);
   $("#theme-btn").innerHTML = saved==="dark" ? MOON : SUN;
 }
+$("#logout-btn").addEventListener("click", logout);
+authInfo().then(()=>{ const u=$("#user-name"); if(u&&_me) u.textContent=_me.username; }).catch(()=>{});
 $("#theme-btn").addEventListener("click", ()=>{
   const cur = document.documentElement.getAttribute("data-theme");
   const next = cur==="dark" ? "light" : "dark";

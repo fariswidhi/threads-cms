@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="id" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Masuk · Threads CMS v2</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body class="login-body">
+<main class="login-wrap">
+  <div class="login-card">
+    <div class="brand login-brand">
+      <div class="logo">T</div>
+      <div class="name">Threads<span>CMS</span> <small>v2</small></div>
+    </div>
+    <h1 class="login-title">Masuk ke dashboard</h1>
+    <p class="login-sub">Gunakan akun admin untuk mengelola konten Threads.</p>
+
+    <form id="login-form" novalidate autocomplete="on">
+      <div class="login-field">
+        <label for="username">Username</label>
+        <input type="text" id="username" name="username" autocomplete="username"
+               autocapitalize="none" spellcheck="false" autofocus required>
+      </div>
+      <div class="login-field">
+        <label for="password">Password</label>
+        <div class="pw-wrap">
+          <input type="password" id="password" name="password" autocomplete="current-password" required>
+          <button type="button" class="pw-toggle" id="pw-toggle" aria-label="Tampilkan password" aria-pressed="false">
+            <svg class="eye" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>
+            <svg class="eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" hidden><path d="M17.9 17.9A10.7 10.7 0 0 1 12 19c-6.5 0-10-7-10-7a18 18 0 0 1 5.1-5.9M9.9 5.2A9.7 9.7 0 0 1 12 5c6.5 0 10 7 10 7a18 18 0 0 1-2.2 3.2M1 1l22 22"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="login-error" id="login-error" role="alert" aria-live="polite" hidden></div>
+      <button type="submit" class="login-submit" id="login-submit">
+        <span class="spin" hidden></span><span class="lbl">Masuk</span>
+      </button>
+    </form>
+    <p class="login-foot">Sesi berakhir otomatis. Jangan bagikan akses ke orang lain.</p>
+  </div>
+</main>
+<script src="/login.js"></script>
+</body>
+</html>

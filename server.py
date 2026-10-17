@@ -21,11 +21,13 @@ import json, sys, threading, time, cgi, io
 from html import escape as _esc
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+from http.cookies import SimpleCookie
+import hmac, ssl
 from pathlib import Path
 from datetime import datetime
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib import db, r2, threads_api, ai  # noqa: E402
+from lib import db, r2, threads_api, ai, auth  # noqa: E402
 from lib import hooks  # noqa: E402
 
 BASE = Path(__file__).resolve().parent
@@ -295,10 +297,136 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    # ── auth helpers ────────────────────────────────────────────────────────
+    def _from_proxy(self):
+        """Request datang dari reverse proxy lokal (Nginx di 127.0.0.1)?"""
+        return self.client_address[0] in ("127.0.0.1", "::1")
+
+    def _client_ip(self):
+        # X-Real-IP hanya dipercaya kalau peer-nya proxy lokal
+        if self._from_proxy():
+            ip = (self.headers.get("X-Real-IP") or "").strip()
+            if ip:
+                return ip[:64]
+        return self.client_address[0]
+
+    def _is_https(self):
+        if isinstance(self.connection, ssl.SSLSocket):
+            return True
+        return (self._from_proxy()
+                and (self.headers.get("X-Forwarded-Proto") or "").lower() == "https")
+
+    def _sec_headers(self):
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("Cache-Control", "no-store")
+
+    def _session_id(self):
+        try:
+            c = SimpleCookie(self.headers.get("Cookie", ""))
+            return c[auth.COOKIE_NAME].value if auth.COOKIE_NAME in c else ""
+        except Exception:
+            return ""
+
+    def _cookie(self, value, max_age):
+        # SameSite=Lax (bukan Strict) supaya redirect balik dari Meta (callback OAuth)
+        # tetap membawa session. CSRF untuk POST dijaga token + cek Origin.
+        parts = [f"{auth.COOKIE_NAME}={value}", "Path=/", "HttpOnly",
+                 "SameSite=Lax", f"Max-Age={max_age}"]
+        if self._is_https():
+            parts.append("Secure")
+        self.send_header("Set-Cookie", "; ".join(parts))
+
+    def _origin_ok(self):
+        """Tolak request lintas-origin: Origin (kalau ada) harus sama dengan Host."""
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        host = (self.headers.get("X-Forwarded-Host") if self._from_proxy() else None) \
+            or self.headers.get("Host", "")
+        return urlparse(origin).netloc.lower() == host.lower()
+
+    def _redirect(self, url):
+        self.send_response(302)
+        self.send_header("Location", url)
+        self.send_header("Content-Length", "0")
+        self._sec_headers()
+        self.end_headers()
+
+    def _auth_gate(self, path):
+        """Return session dict kalau login. Kalau belum: kirim 401/redirect dan return None."""
+        sess = auth.get_session(self._session_id())
+        if sess:
+            return sess
+        if path.startswith("/api/"):
+            self._json({"error": "unauthorized"}, 401)
+        else:
+            self._redirect("/login")
+        return None
+
+    def _login_page(self):
+        if auth.get_session(self._session_id()):
+            return self._redirect("/")
+        return self._static("login.html")
+
+    def _do_login(self):
+        ip = self._client_ip()
+        if not self._origin_ok():
+            return self._json({"error": "forbidden"}, 403)
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        if n > 4096:
+            return self._json({"error": "request terlalu besar"}, 413)
+        try:
+            body = json.loads(self.rfile.read(n) or b"{}")
+            username, password = str(body.get("username", "")), str(body.get("password", ""))
+        except Exception:
+            return self._json({"error": "request tidak valid"}, 400)
+        if not username.strip() or not password:
+            return self._json({"error": "Username dan password wajib diisi"}, 400)
+        wait = auth.retry_after(ip, username)
+        if wait:
+            data = json.dumps({"error": f"Terlalu banyak percobaan. Coba lagi dalam {max(1, wait // 60)} menit."}).encode()
+            self.send_response(429)
+            self.send_header("Retry-After", str(wait))
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self._sec_headers()
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if not auth.verify_login(username, password):
+            auth.record_failure(ip, username)
+            return self._json({"error": "Username atau password salah"}, 401)
+        auth.record_success(ip, username)
+        # session ID baru tiap login; session lama di cookie (kalau ada) dicabut
+        auth.destroy_session(self._session_id())
+        sid, _csrf = auth.create_session(username.strip().lower())
+        data = b'{"ok": true}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self._cookie(sid, auth.SESSION_TTL)
+        self._sec_headers()
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _do_logout(self, sess):
+        auth.destroy_session(self._session_id())
+        data = b'{"ok": true}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self._cookie("", 0)
+        self._sec_headers()
+        self.end_headers()
+        self.wfile.write(data)
+
     def _json(self, obj, code=200):
         data = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self._sec_headers()
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -312,10 +440,24 @@ class H(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         path = u.path
         try:
+            # ── publik (tanpa login) ──
+            if path == "/login":
+                return self._login_page()
+            if path in ("/login.js", "/app.css"):
+                return self._static(path.lstrip("/"))
+            if path == "/api/auth/me":
+                sess = auth.get_session(self._session_id())
+                if not sess:
+                    return self._json({"authenticated": False}, 401)
+                return self._json({"authenticated": True, "username": sess["username"],
+                                   "csrf": sess["csrf"]})
+            # ── semua yang lain wajib login ──
+            if not self._auth_gate(path):
+                return
             if path in ("/", "/index.html"):
                 return self._static("index.html")
-            if path in ("/app.css", "/app.js"):
-                return self._static(path.lstrip("/"))
+            if path == "/app.js":
+                return self._static("app.js")
             if path == "/api/accounts":
                 return self._json(db.list_accounts())
             if path == "/api/posts":
@@ -388,6 +530,17 @@ class H(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         path = u.path
         try:
+            if path == "/api/auth/login":
+                return self._do_login()
+            sess = self._auth_gate(path)
+            if not sess:
+                return
+            # CSRF: token per-session di header + Origin harus sama dgn Host
+            if not (self._origin_ok() and hmac.compare_digest(
+                    self.headers.get("X-CSRF-Token", ""), sess["csrf"])):
+                return self._json({"error": "csrf token tidak valid"}, 403)
+            if path == "/api/auth/logout":
+                return self._do_logout(sess)
             if path == "/api/upload":
                 return self._upload()
             body = self._body()
@@ -696,8 +849,7 @@ a{{color:#5b8cff}}</style></head><body><div class=box>
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Referrer-Policy", "no-referrer")
+            self._sec_headers()
             self.end_headers()
             self.wfile.write(data)
 
@@ -731,6 +883,7 @@ a{{color:#5b8cff}}</style></head><body><div class=box>
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        self._sec_headers()
         self.end_headers()
         self.wfile.write(data)
 
@@ -757,6 +910,9 @@ def _start_oauth_https():
 
 def main():
     db.init_db()
+    if not auth.has_admin():
+        print("[auth] PERINGATAN: belum ada admin, login mustahil. Jalankan: "
+              ".venv/bin/python scripts/set_admin.py <username>", flush=True)
     cfg = threads_api.oauth_config()
     for prob in threads_api.oauth_config_problems(cfg):
         print(f"[oauth] PERINGATAN: {prob}", flush=True)

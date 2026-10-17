@@ -33,6 +33,9 @@ def init_db():
     v4 = BASE / "db" / "schema_v4.sql"
     if v4.exists():
         con.executescript(v4.read_text())
+    v5 = BASE / "db" / "schema_v5.sql"
+    if v5.exists():
+        con.executescript(v5.read_text())
     # migrasi kolom soft-sell (idempotent)
     cols = {r["name"] for r in con.execute("PRAGMA table_info(posts)").fetchall()}
     if "softsell_link" not in cols:
